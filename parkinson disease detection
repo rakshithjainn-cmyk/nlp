@@ -1,0 +1,184 @@
+parkinsons-ensemble-ml/
+├── README.md
+├── requirements.txt
+├── .gitignore
+├── data/
+│   └── parkinsons.csv      # Dataset (voice data, biomedical markers)
+├── src/
+│   ├── preprocess.py
+│   ├── feature_engineering.py
+│   ├── models.py
+│   ├── train.py
+│   └── eval.py
+├── app/
+│   └── api.py              # FastAPI inference API
+└── scripts/
+    └── run_train.sh
+## `requirements.txt`
+numpy
+pandas
+scikit-learn
+xgboost
+matplotlib
+seaborn
+fastapi
+uvicorn
+joblib
+pydantic
+```
+
+---
+
+## `.gitignore`
+
+```
+__pycache__/
+*.pyc
+.env
+*.pkl
+*.joblib
+venv/
+logs/
+```
+
+---
+
+## `src/preprocess.py`
+
+```python
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+def load_data(path='data/parkinsons.csv'):
+    df = pd.read_csv(path)
+    X = df.drop(columns=['status'])  # Assuming 'status' column is label
+    y = df['status']
+    return X, y
+
+
+def preprocess_data(X, y, test_size=0.2, random_state=42):
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=random_state)
+    return X_train, X_test, y_train, y_test, scaler
+```
+
+---
+
+## `src/feature_engineering.py`
+
+```python
+import pandas as pd
+from sklearn.feature_selection import SelectKBest, f_classif
+
+def select_features(X, y, k=10):
+    selector = SelectKBest(score_func=f_classif, k=k)
+    X_new = selector.fit_transform(X, y)
+    return X_new, selector.get_support(indices=True)
+```
+
+---
+
+## `src/models.py`
+
+```python
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+
+
+def build_models():
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    xgb = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    svm = SVC(probability=True, kernel='rbf', random_state=42)
+
+    ensemble = VotingClassifier(estimators=[
+        ('rf', rf),
+        ('xgb', xgb),
+        ('svm', svm)
+    ], voting='soft')
+
+    return rf, xgb, svm, ensemble
+```
+
+---
+
+## `src/train.py`
+
+```python
+import joblib
+from sklearn.metrics import accuracy_score, classification_report
+from src.preprocess import load_data, preprocess_data
+from src.feature_engineering import select_features
+from src.models import build_models
+
+
+def train_and_evaluate():
+    X, y = load_data()
+    X_train, X_test, y_train, y_test, scaler = preprocess_data(X, y)
+    X_train_fs, selected = select_features(X_train, y_train, k=10)
+    X_test_fs = X_test[:, selected]
+
+    rf, xgb, svm, ensemble = build_models()
+    ensemble.fit(X_train_fs, y_train)
+
+    preds = ensemble.predict(X_test_fs)
+    print("Accuracy:", accuracy_score(y_test, preds))
+    print(classification_report(y_test, preds))
+
+    joblib.dump(ensemble, 'models/ensemble_model.joblib')
+    joblib.dump(scaler, 'models/scaler.joblib')
+    print("Model saved to models/")
+
+
+if __name__ == '__main__':
+    train_and_evaluate()
+```
+
+---
+
+## `src/eval.py`
+
+```python
+import joblib
+import numpy as np
+
+def predict_single(sample, model_path='models/ensemble_model.joblib', scaler_path='models/scaler.joblib'):
+    model = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+    sample = np.array(sample).reshape(1, -1)
+    sample_scaled = scaler.transform(sample)
+    pred = model.predict(sample_scaled)
+    return int(pred[0])
+```
+
+---
+
+## `app/api.py`
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from src.eval import predict_single
+
+app = FastAPI(title="Parkinson's Detection API")
+
+class Sample(BaseModel):
+    features: list
+
+@app.post('/predict')
+async def predict(sample: Sample):
+    result = predict_single(sample.features)
+    return {"prediction": result, "label": "Parkinson's" if result == 1 else "Healthy"}
+
+# Run: uvicorn app.api:app --reload --port 8000
+```
+
+---
+
+## `scripts/run_train.sh`
+
+```bash
+#!/usr/bin/env bash
+python src/train.py
