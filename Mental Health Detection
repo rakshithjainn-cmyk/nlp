@@ -1,0 +1,286 @@
+## requirements.txt
+transformers>=4.30.0
+datasets>=2.0.0
+torch>=1.12.0
+scikit-learn
+pandas
+numpy
+fastapi
+uvicorn
+python-multipart
+pydantic
+sentencepiece
+accelerate
+joblib
+spacy
+nltk
+## .gitignore
+__pycache__/
+*.pyc
+.env
+models/
+*.pt
+*.pth
+logs/
+data/
+
+## data/sample.csv
+# CSV with header: text,label
+# Example:
+# "i feel hopeless and sad",depression
+# "i'm anxious about exams",anxiety
+## src/preprocess.py
+
+```python
+# src/preprocess.py
+import re
+import pandas as pd
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+nltk.download('stopwords')
+nltk.download('wordnet')
+
+STOP = set(stopwords.words('english'))
+LEMMATIZER = WordNetLemmatizer()
+
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
+    text = re.sub(r"@[A-Za-z0-9_]+", "", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    tokens = [t for t in text.split() if t not in STOP]
+    tokens = [LEMMATIZER.lemmatize(t) for t in tokens]
+    return " ".join(tokens)
+
+
+def load_and_clean(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    if 'text' not in df.columns or 'label' not in df.columns:
+        raise ValueError("CSV must contain 'text' and 'label' columns")
+    df['text'] = df['text'].astype(str).apply(clean_text)
+    df = df.dropna(subset=['text', 'label']).reset_index(drop=True)
+    return df
+## src/dataset.py
+
+```python
+# src/dataset.py
+from torch.utils.data import Dataset
+from transformers import AutoTokenizer
+import torch
+
+class MHTextDataset(Dataset):
+    def __init__(self, texts, labels, model_name='bert-base-uncased', max_length=128):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        self.texts = texts
+        self.labels = labels
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        inputs = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        item = {k: v.squeeze(0) for k, v in inputs.items()}
+        if self.labels is not None:
+            item['labels'] = torch.tensor(self.labels[idx], dtype=torch.long)
+        return item
+## src/train.py
+
+```python
+# src/train.py
+import os
+import random
+import numpy as np
+import torch
+from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+from src.dataset import MHTextDataset
+from src.preprocess import load_and_clean
+from sklearn.model_selection import train_test_split
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def compute_metrics(p):
+    from sklearn.metrics import accuracy_score, f1_score
+    preds = np.argmax(p.predictions, axis=1)
+    acc = accuracy_score(p.label_ids, preds)
+    f1 = f1_score(p.label_ids, preds, average='weighted')
+    return {"accuracy": acc, "f1_weighted": f1}
+
+
+def main(
+    data_path='data/sample.csv',
+    model_name='bert-base-uncased',
+    output_dir='models/bert-mh',
+    epochs=3,
+    batch_size=16,
+    max_length=128
+):
+    seed_everything()
+    os.makedirs(output_dir, exist_ok=True)
+
+    df = load_and_clean(data_path)
+    # map labels
+    if df['label'].dtype == object:
+        label2id = {l: i for i, l in enumerate(sorted(df['label'].unique()))}
+        id2label = {v:k for k,v in label2id.items()}
+        df['label'] = df['label'].map(label2id)
+    else:
+        unique = sorted(df['label'].unique())
+        label2id = {l:i for i,l in enumerate(unique)}
+        id2label = {v:k for k,v in label2id.items()}
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        df['text'].tolist(), df['label'].tolist(), test_size=0.15, random_state=42, stratify=df['label']
+    )
+
+    train_dataset = MHTextDataset(X_train, y_train, model_name=model_name, max_length=max_length)
+    val_dataset = MHTextDataset(X_val, y_val, model_name=model_name, max_length=max_length)
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=len(label2id), id2label=id2label, label2id=label2id)
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        evaluation_strategy='epoch',
+        save_strategy='epoch',
+        logging_steps=50,
+        load_best_model_at_end=True,
+        metric_for_best_model='f1_weighted',
+        greater_is_better=True,
+        fp16=torch.cuda.is_available(),
+        save_total_limit=2
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics
+    )
+
+    trainer.train()
+    trainer.save_model(output_dir)
+    # save label mapping for inference
+    import json
+    with open(os.path.join(output_dir,'label_map.json'),'w') as f:
+        json.dump(id2label, f)
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', default='data/sample.csv')
+    parser.add_argument('--model_name', default='bert-base-uncased')
+    parser.add_argument('--output_dir', default='models/bert-mh')
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--max_length', type=int, default=128)
+    args = parser.parse_args()
+    main(**vars(args))
+# src/eval.py
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch
+import json
+
+
+def predict_texts(texts, model_dir, max_length=128, device=None):
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for t in texts:
+            inputs = tokenizer(t, return_tensors='pt', truncation=True, padding='max_length', max_length=max_length)
+            inputs = {k:v.to(device) for k,v in inputs.items()}
+            logits = model(**inputs).logits
+            pred = torch.argmax(logits, dim=1).cpu().numpy()[0]
+            all_preds.append(int(pred))
+    return all_preds
+
+
+def evaluate(test_texts, test_labels, model_dir):
+    preds = predict_texts(test_texts, model_dir)
+    print(classification_report(test_labels, preds))
+    print('Confusion matrix:')
+    print(confusion_matrix(test_labels, preds))
+## src/inference.py
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import json
+
+
+def load_model(model_dir='models/bert-mh'):
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    with open(f'{model_dir}/label_map.json','r') as f:
+        label_map = json.load(f)
+    return tokenizer, model, label_map, device
+
+
+def predict(text, model_dir='models/bert-mh', max_length=128):
+    tokenizer, model, label_map, device = load_model(model_dir)
+    model.eval()
+    inputs = tokenizer(text, return_tensors='pt', truncation=True, padding='max_length', max_length=max_length)
+    inputs = {k:v.to(device) for k,v in inputs.items()}
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        prob = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        idx = int(prob.argmax())
+    return {'label_id': idx, 'label_name': label_map[str(idx)] if str(idx) in label_map else label_map[idx], 'probs': prob.tolist()}
+
+if __name__ == '__main__':
+    import sys
+    txt = ' '.join(sys.argv[1:]) or "i feel very sad and hopeless"
+    print(predict(txt))
+## app/api.py
+
+```python
+# app/api.py
+from fastapi import FastAPI
+from pydantic import BaseModel
+from src.inference import predict
+
+app = FastAPI(title='Mental Health Detection API')
+
+class TextIn(BaseModel):
+    text: str
+
+class PredictionOut(BaseModel):
+    label_id: int
+    label_name: str
+    probs: list
+
+@app.post('/predict', response_model=PredictionOut)
+async def predict_endpoint(payload: TextIn):
+    res = predict(payload.text)
+    return res
+
+# Run: uvicorn app.api:app --host 0.0.0.0 --port 8000
